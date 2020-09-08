@@ -1,0 +1,786 @@
+---
+title: "AMS 2013-2014 Solar Energy Prediction Contest"
+author: "Julius Sello"
+date: "7/18/2020"
+output:
+  html_document:
+    theme: 'cosmo'
+    highlight: 'tango'
+    fig_caption: yes
+    number_sections: true
+    toc: yes
+    toc_float:
+      smooth_scroll: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{css, echo=F, message=F}
+.columns{display:flex;}
+body{font-family: Montserrat;}
+h1{font-size: 300%; color:#b70122;}
+h2{font-size: 250%; color:#dfae00;}
+h3{font-size: 200%; color:#dfae00;}
+p{align=center;}
+```
+
+```{r, echo=F, message=FALSE}
+knitr::opts_chunk$set(include = TRUE, echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE);
+library(tidyverse)
+library(lubridate)
+library(PerformanceAnalytics)
+library(outliers)
+library(ggplot2)
+library(ggcorrplot)
+library(corrplot)
+library(caTools)
+library(lattice)
+library(caret)
+library(xgboost)
+library(data.table)
+library(foreach)
+library(e1071)
+library(iterators)
+library(parallel)
+library(doParallel)
+library(sp)
+library(rgdal)
+library(Formula)
+library(sf)
+```
+
+```{r,echo=F}
+###################  DATAFILE PATHS  #####################################
+
+add_path <- '/Users/jvs22/Desktop/project/additional_variables.RData' # additional variables
+solar_path <- '/Users/jvs22/Desktop/project/solar_dataset.RData' # solar stations 
+station_info_path <- '/Users/jvs22/Desktop/project/station_info.csv' # station info 
+
+##########################    LOADING THE DATA    ###################################
+
+add_var <- as.data.frame(readRDS(add_path))
+solar <- as.data.frame(readRDS(solar_path))
+station_info <- read.csv(station_info_path)
+```
+
+
+# **EDA** #
+
+**This chapter covers the Exploratory Data Anylsis, which refers to the critical process of performing initial investigations on data so as to discover patterns, to spot anomalies, to test hypothesis and to check assumptions with the help of summary statistics and graphical representations.**
+
+## Transforming the datasets into subsets
+
+To begin with, the three loaded datasets were split up and transformed into smaller subsets. 
+
+Firstly, a new variable (solar_farms) for the 98 stations (from 2nd to 99th position) was created. These represent the real values of solar production recorded in 98 different weather stations (Mesonets). The columns included are only informed until 2007-12-31 (row 5113); after this date the 98 columns contain NA or missing values. These missing values will be predicted in the final section of this Analysis. For the new varibale the 1796 missing rows were removed and the *Date* column was adjusted to the *US-Central* timezone and converted to a numerical value.
+
+Secondly, the Principal Components of the PCA Anyalsis were saved in a new variable (PC_values) and reduced to 5113 rows. It has a total number of 357 columns.
+
+Thirdly, the additional variables were saved in a new variable (add_var) and the *Date* column was adjusted accordingly. Each row corresponds to information of a particular day (real Numerical Weather Prediction, NWP, etc.), ranging from 1994-01-01 to 2012-11-30. The total number of rows (6909) and columns (100) was kept the same for training and prediction purposes.
+
+Finally, the station information were saved in a new variable (stations_info). Representing the name, latitude, longitude, and elevation of each of the 98 solar stations.
+
+```{r, echo=F}
+solar_farms <- solar[1:5113,1:99]
+solar_farms_col_names <- colnames(solar_farms)[-1]  #extracting the 98 different stations
+solar_farms$Date <- as.POSIXct(strptime(solar_farms$Date,format = '%Y%m%d', tz = 'us/central'))
+
+PC_values <- solar[1:5113,100:ncol(solar)]    #extracting all of the PC_values from the data
+
+add_var$Date <- as.POSIXct(strptime(add_var$Date,format = '%Y%m%d', tz = 'us/central'))   #changing the date 
+```
+
+## Data Scaling and Removal of NAs
+
+**In this chapter the newly obtained variables are being normalized. This is a process in which data attributes within a data model are organized to increase the cohesion of entity types. In other words, the goal of data normalization is to reduce and even eliminate data redundancy. Furthermore, anomalies/outliers will be removed/replaced when running over each row/column.**
+
+### Additional Variables
+
+Evidently, the dataset of the additional variables contains a large number of missing values (NAs). This means that these need to be removed/replaced. After applying different methods, the most suitable for this dataset is the *find and replace* method, using the *Median* as the replacement factor. Since the dataset contains extreme values, the median is a much more representative number for the sample, than the mean (better for normally distributed data). Nonetheless, two new variables (add_var_scaled, add_var_scaled_nout) were created in order to compare the outcome of the normalization as well as the removal of the outliers.
+
+The first graph shows the original state of the additional variables, without any data cleaning, except NA replacement. As it can be seen the threshold of the value lies at around 80. 
+
+The second graph portrays the normalized additional variables and now the threshold lies at around 30. Hence, the data points are more compressed than before.
+
+The third graph shows the normalized additional variabel where also the outliers were removed. Here the threshold is at around 15, an even more compressed representation of the datapoints.
+
+Through these graphical representations one can very well see the changes resulting from the data cleaning processed. Which one of the new variables is the most significant will be further evaluated in the subsequent steps.
+
+```{r, echo=F}
+add_var_scaled <- add_var
+
+for(i in 2:ncol(add_var_scaled)){   #replacing all of the NA's of the additional variables with the median
+  add_var_scaled[,i][is.na(add_var_scaled[,i])] <- median(as.numeric(add_var_scaled[,i]),na.rm = T)
+  add_var_scaled[,i] <- (add_var_scaled[,i]-mean(as.numeric(add_var_scaled[,i])))/sd(as.numeric(add_var_scaled[,i])) # doing normalization of the variables
+}
+
+add_var_scaled_nout <- add_var_scaled
+
+n <- 1
+while (n <= 6){
+  #replacing outliers with the median of the variable
+  for (i in 2:ncol(add_var_scaled_nout)){       
+    add_var_scaled_nout[,i] <- rm.outlier(as.numeric(add_var_scaled_nout[,i]),fill = T,median = T)
+  }
+  n <- n+1
+}
+
+# plotting the scaled, the scaled and outlier removed additional variables
+add_var_box <- gather(add_var, key = 'Variables',value = 'Values',-Date)
+add_var_scaled_box <- gather(add_var_scaled, key = 'Variables',value = 'Values',-Date)
+add_var_scaled_nout_box <- gather(add_var_scaled_nout, key = 'Variables',value = 'Values',-Date)
+
+ggplot(add_var_box,aes(Variables,Values)) + geom_boxplot(col="red") +
+  labs(title="Additional Variables", subtitle="Without data cleaning",caption="add_var_dataset") +
+  theme(axis.text.x = element_text(angle = 90),legend.position = 'none',panel.grid.major = element_blank())
+
+ggplot(add_var_scaled_box,aes(Variables,Values)) + geom_boxplot(col ="orange") + 
+  labs(title="Additional Variables", subtitle="Normalized + outliers",caption="add_var_dataset") +
+  theme(axis.text.x = element_text(angle = 90),legend.position = 'none',panel.grid.major = element_blank())
+
+ggplot(add_var_scaled_nout_box,aes(Variables,Values)) + geom_boxplot(col = "green") + 
+  labs(title="Additional Variables", subtitle="Normalized + no outliers",caption="add_var_dataset") +
+  theme(axis.text.x = element_text(angle = 90),legend.position = 'none',panel.grid.major = element_blank())
+```
+
+### Correlation Matrix of the additional variables
+
+This correlation matrix shows how the 100 additional variables are correlated with each other. The redness indicates the positivity of the correlations. As it can be clearly seen there is no negative correlation (otherwise inidicated by a bluish colour), but rather a positive one between all of them. There are certain clusters, tighly surrounding the diagonal, indicating a stronger correlation.
+
+```{r, echo=F}
+#creating correlation matrix between the normalized 100 variables
+cormat <- signif(cor(add_var_scaled[,-1],use = "complete.obs"),2)  
+ord <- corrMatOrder(cormat, order="hclust")
+cormat <- cormat[ord, ord]
+#plotting a correlation map for the normalized 100 variables
+par(mfrow = c(1,1))
+ggcorrplot(cormat) + 
+  theme(axis.text.x = element_text(color = "grey20", size = 5, angle = 90, hjust = .5, vjust = .5, face = "plain"),
+  axis.text.y = element_text(color = "grey20", size = 5, angle = 0, hjust = 1, face = "plain")) +
+  ggtitle('Correlation map for the normalized 100 variables')
+```
+
+After taking all things into consideration, Team C decided to proceed with the variable that is normalized and also removed from any outliers: add_var_scaled_nout. This will be the key variable used for further analysis throughout this project.
+
+### Solar stations
+
+In this section the production values of the 98 solar stations will be cleaned. To find out what effect a potential normalization has on the values, only one station (ACME) was tested. After a successful implementation, the same process was applied to all of the 98 stations and its respective production values resulting in the new variable: solar_farms_scaled. In a separate step the original production values were cleaned, by removing clear outliers, resulting in another variable, solar_farms_nout. The significance of these three variable will be further explored with graphical representations.
+
+```{r, echo=F, message=F}
+# normalization for one particular station (ACME) for testing purposes
+lapply(solar_farms[,-1], function(x) (x-mean(as.numeric(x)))/sd(as.numeric(x)))$ACME
+
+solar_farms_scaled <- solar_farms
+
+i <- 1
+for(i in 1:nrow(solar_farms_scaled)){
+  solar_farms_scaled[i,-1] <- (solar_farms_scaled[i,-1]-mean(as.numeric(solar_farms_scaled[i,-1])))/sd(as.numeric(solar_farms_scaled[i,-1]))
+}
+
+solar_farms_nout <- solar_farms
+
+n <- 1
+while (n <= 11){
+  for (i in 1:nrow(solar_farms_nout)){       #replacing outliers with the median of the 98 Stations
+    solar_farms_nout[i,-1] <- rm.outlier(as.numeric(solar_farms_nout[i,-1]),fill = T,median = T)
+  }
+  n <- n+1
+}
+```
+
+
+The first boxplot shows the production values for the 98 stations in its raw format, in other words without any data cleaning.
+
+
+```{r, echo=F}
+#Boxplot of all the 98 production stations without cleaning
+solar_farms_box <- gather(solar_farms, key = 'Stations',value = 'values',-Date)
+ggplot(solar_farms_box,aes(x = Stations, y = values)) + geom_boxplot(aes(fill = T)) + 
+  theme(axis.text.x = element_text(angle = 90),legend.position = 'none',panel.grid.major = element_blank(),panel.background = element_rect(fill = "white")) +
+  ggtitle('Boxplot for the 98 solar stations in the State of Oklahoma')
+```
+
+
+The second boxplot shows the production values of the 98 solar stations, with normalized as well as outlier removed values. Evidently, the values are spread less frequently and the median is distributed more evenly.
+
+
+```{r, echo=F}
+# plotting the normalized and outlier removed solar stations
+solar_farms_scaled_clean_box <- gather(solar_farms_nout, key = 'Stations',value = 'Values',-Date)
+ggplot(solar_farms_scaled_clean_box,aes(x = Stations, y = Values)) + geom_boxplot(aes(fill = T)) + 
+  theme(axis.text.x = element_text(angle = 90),legend.position = 'none',panel.grid.major = element_blank()) +
+  ggtitle('Scaled and cleaned Boxplot for the 98 solar stations in the State of Oklahoma')
+```
+
+```{r, echo=F, eval=F}
+# plotting the normalized solar stations
+solar_farms_scaled_box <- gather(solar_farms_scaled, key = 'Stations',value = 'Values',-Date)
+ggplot(solar_farms_scaled_box,aes(x = Stations, y = Values)) + geom_boxplot(aes(fill = T)) + 
+  theme(axis.text.x = element_text(angle = 90),legend.position = 'none',panel.grid.major = element_blank()) +
+  ggtitle('Scaled Boxplot for the 98 solar stations in the State of Oklahoma')
+
+# plotting the outlier removed solar stations
+solar_farms_box_clean <- gather(solar_farms_nout, key = 'Stations',value = 'values',-Date)
+ggplot(solar_farms_box_clean,aes(x = Stations, y = values)) + geom_boxplot(aes(fill = T)) + 
+  theme(axis.text.x = element_text(angle = 90),legend.position = 'none',panel.grid.major = element_blank(),panel.background = element_rect(fill = "white")) +
+  ggtitle('Boxplot for the 98 solar stations in the State of Oklahoma cleaned')
+```
+
+### All 98 Production Stations w/ and w/o outliers
+
+The following selection of graphs show two different series of every single solar station. The top one shows the original format, without any data cleaning. The bottom one shows the solar stations, where three loops of outliers were removed. As it can be seen, there are no clear anomalies nor gaps between the years anymore.
+
+```{r, echo=F}
+# showing the production of each stations
+title_plot <- paste('After running the rm.outlier',n-1,'times')
+# line plot after removal for every single stations
+par(mfrow = c(2,1), mar = c(3,4,1,4))
+for (i in 2:ncol(solar_farms)){
+  plot(solar_farms$Date,solar_farms[,i], col = i, type = 'l',main = solar_farms_col_names[i-1], xlab = '',xaxt='n', ylab = 'Radiation')
+  plot(solar_farms$Date,solar_farms_nout[,i], col = i, type = 'l',main = title_plot, ylab = 'Radiation')
+}
+```
+
+### Density Plot of the 98 solar stations
+
+The following two graphs show the density of the solar stations. The first one represents the density without any outlier correction, whereas the second one shows the cleaned (no outliers) production values. Again it can be clearly seen that the lines are much closer aligned, creating a much stronger bundle, without any obvious exceptions.
+
+```{r, echo=F}
+x <- solar_farms[,2]
+plot(density(as.numeric(x)),col = 1, ylim = c(0,6e-08),main = 'Density plot before cleaning')
+for (i in 2:length(solar_farms)){
+  x <- solar_farms[,i]
+  lines(density(as.numeric(x)),col = i)
+}
+
+x <- solar_farms_nout[,2]
+plot(density(as.numeric(x)),col = 1, ylim = c(0,6e-08),main = 'Density plot after cleaning')
+for (i in 2:length(solar_farms_nout)){
+  x <- solar_farms_nout[,i]
+  lines(density(as.numeric(x)),col = i)
+}
+```
+
+## Summary Statistics
+The summary statistics provides the most fundamental information and description of the data. It includes the mean, median, mode, minimum value, maximum value, range, standard deviation, etc.
+
+```{r, echo=F}
+summary(add_var_scaled_nout) #summary statistics of the standardized + outlier removed additional variables
+
+summary(solar_farms)  #summary statistics of solar_farms before cleaning
+```
+
+Since the normalization as well as outlier removal had such a significant impact on the overall values, the *add_var_scaled_nout* variable will be used throughout the rest of the analysis.
+
+In terms of the solar stations, the normalization/outlier removal had a far less significant impact and since the romaval might also bear detrimental effects, Team C has decided to not pursue the prediction section with the adjusted values, but rather with the original ones. Hence, the variable *solar_farms* will be used as the corresponding variable throughout this analysis. The effects will become more evident in the ML section.
+
+```{r, echo=F, eval=F}
+summary(add_var) #summary statistics of the additional variables before cleaning
+summary(add_var_scaled) #summary statistics of the standardized additional variables
+summary(add_var_scaled_nout) #summary statistics of the standardized + outlier removed additional variables
+
+summary(solar_farms)  #summary statistics of solar_farms before cleaning
+summary(solar_farms_scaled)  #summary statistics of solar_farms after normalization
+summary(solar_farms_nout)  #summary statistics of solar_farms after outlier removal
+```
+
+## Correlation Matrix - Elevation vs Solar Stations
+
+As a final step the correlation between the solar stations and their respective elevations is shown in the matrix below. The points are scattered towards a lineartiy and the red line suggests a linear correlation. Therefore, the elevation does seem to be significant in terms of the production values of the solar stations.
+
+```{r, echo=F}
+#calculating the average production of the 98 Stations
+mean_stations <- as.data.frame(sapply(solar_farms[,-1],mean,2))    
+colnames(mean_stations) <- 'mean'
+mean_geo_station <- cbind(mean_stations,station_info[,-1]) #joining the stations together with elevation
+
+#creating a linear model for the elevation as predictors and the production as predicted
+lm_elev <- lm(mean ~ elev,mean_geo_station) 
+plot(mean_geo_station$elev,mean_geo_station$mean, xlab = 'Elevation', ylab = 'Average Solar production', main = 'Correletion of Elevation and average production')
+abline(lm_elev, col = 'red')
+# summary(lm_elev)    
+# Adjusted R-squared is 0.6633. We can explain 66.33% of the variance of the dependent variable the output
+```
+
+##  The 98 solar stations on the Map of Oklahoma
+
+As a final step the correlation between the solar stations and their respective elevations is shown in the matrix below. The points are scattered vaguely towards a lineartiy and the red line suggests a linear correlation. Therefore, the elevation does seem to be significant in terms of the production values of the solar stations.
+
+```{r, echo=F, message=F}
+okh_shape <- st_read('/Users/jvs22/Desktop/project/tl_2010_40_county10/tl_2010_40_county10.shp')
+
+ggplot(okh_shape) + 
+  geom_sf(mapping = aes(fill = 'blue'),
+          color = "white",
+          size = 0.4) +
+  theme(panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = 'none') +
+  xlab('') + ylab('') +
+  geom_point(data = station_info,  # Add and plot speices data
+             shape=8, col = 'blue',
+             size = 3,
+             aes(x = elon, 
+                 y = nlat, group = elev, col = elev)) +
+  ggtitle("Localization of the Solar Stations in Oklahoma") +
+  scale_fill_manual(values = 'grey')
+```
+
+# **Dimensionality Reduction**
+
+**This section focusses on reducing the dimensions of the feature set, in other words reducing the number of input variables in the dataset. Some of these features are correlated and hence redundant, which is the main purpose of dimensionality reduction. Apart from using PCA Analysis, the variable importance can be identified through filtering. Variable importance is target-dependent, i.e. it takes into account which value or column should be predicted and tries to infer which input variables could be more effective, in order to do so.**
+
+After conducting an in-depth research, Team C decided to perform the dimensionality reduction by variable importance, instead of proceeding with the PCA Analysis. To start off with a familiarisation of the filterVarImp() formula had to be done. After several executions of this formula, it was decided to filter for the top 80 variables (out of the 100 additional ones). After completing this pre selection, a further drill down had to be made, resulting in the top 50 out of the top 80. Each one of these 50 variables had at least an impact on 85 stations and its production values accordingly (ranging up to 98 -> all of them). These 50 most significant *additional variables* are used throughout the ML prediction model in the final section of this analysis. 
+
+```{r, echo=T}
+x2 <- filterVarImp(add_var_scaled_nout[1:5113,-1],solar_farms[,2])
+x2 <- rbind(x2,filterVarImp(PC_values,solar_farms[,2]) )
+top_100_scaled_nout <- top_n(arrange(x2,desc(x2$Overall)),100)
+y2 <- data_frame(Variable = rownames(top_100_scaled_nout), Values = top_100_scaled_nout$Overall, Station = rep(colnames(solar_farms)[2],100))
+
+for(i in 3:ncol(solar_farms)){
+  x2 <- filterVarImp(add_var_scaled_nout[1:5113,-1],solar_farms[,i])
+  x2 <- rbind(x2,filterVarImp(PC_values,solar_farms[,i]) )
+  top_100_scaled_nout <- top_n(arrange(x2,desc(x2$Overall)),100)
+  x2 <- data_frame(Variable = rownames(top_100_scaled_nout), Values = top_100_scaled_nout$Overall, Station = rep(colnames(solar_farms)[2],100))
+  y2 <- rbind(y2,x2)
+}
+
+z2 <- group_by(y2,Variable) %>% summarise(n = n()) %>% arrange(desc(n)) %>% top_n(80)
+view(z2)
+```
+
+```{r, echo=F}
+# Variable importance to identify the top 80 using solar_farms and additional variable without any cleaning
+x <- filterVarImp(add_var[1:5113,-1],solar_farms[,2])
+top_80 <- top_n(arrange(x,desc(x$Overall)),80)
+y <- data_frame(Variable = rownames(top_80), Values = top_80$Overall, Station = rep(colnames(solar_farms)[2],80))
+
+for(i in 3:ncol(solar_farms)){
+  x <- filterVarImp(add_var_scaled[1:5113,-1],solar_farms[,i])
+  top_80 <- top_n(arrange(x,desc(x$Overall)),80)
+  x <- data_frame(Variable = rownames(top_80), Values = top_80$Overall, Station = rep(colnames(solar_farms)[i],80))
+  y <- rbind(y,x)
+}
+view(group_by(y,Variable) %>% summarise(n = n()) %>% arrange(desc(n)))
+
+# Variable importance to identify the top 80 using solar_farms and additional variable scaled
+x1 <- filterVarImp(add_var_scaled[1:5113,-1],solar_farms[,2])
+top_80_scaled <- top_n(arrange(x1,desc(x1$Overall)),80)
+y1 <- data_frame(Variable = rownames(top_80_scaled), Values = top_80_scaled$Overall, Station = rep(colnames(solar_farms)[2],80))
+
+for(i in 3:ncol(solar_farms)){
+  x1 <- filterVarImp(add_var_scaled[1:5113,-1],solar_farms[,i])
+  top_80_scaled <- top_n(arrange(x1,desc(x1$Overall)),80)
+  x1 <- data_frame(Variable = rownames(top_80_scaled), Values = top_80_scaled$Overall, Station = rep(colnames(solar_farms)[i],80))
+  y1 <- rbind(y1,x1)
+}
+view(group_by(y1,Variable) %>% summarise(n = n()) %>% arrange(desc(n)) %>% filter(n == 98))
+
+# Variable importance to identify the top 80 using solar_farms + removed outliers and additional variable scaled + removed outliers
+x3 <- filterVarImp(add_var_scaled_nout[1:5113,-1],solar_farms_nout[,2])
+top_80_scaled_nout_both <- top_n(arrange(x3,desc(x3$Overall)),80)
+y3 <- data_frame(Variable = rownames(top_80_scaled_nout_both), Values = top_80_scaled_nout_both$Overall, Station = rep(colnames(solar_farms_nout)[2],80))
+
+for(i in 3:ncol(solar_farms_nout)){
+  x3 <- filterVarImp(add_var_scaled_nout[1:5113,-1],solar_farms_nout[,i])
+  top_80_scaled_nout_both <- top_n(arrange(x3,desc(x3$Overall)),80)
+  x3 <- data_frame(Variable = rownames(top_80_scaled_nout_both), Values = top_80_scaled_nout_both$Overall, Station = rep(colnames(solar_farms_nout)[i],80))
+  y3 <- rbind(y3,x3)
+}
+view(group_by(y3,Variable) %>% summarise(n = n()) %>% arrange(desc(n)))
+
+```
+
+# **Machine Learning Prediction Models**
+
+**Predictive modeling is a process that uses data and statistics to predict outcomes with data models. The goal of this chapter is to train a machine learning model to predict the solar production in the 98 stations from dates ranging from 2008-01-01 to 2012-11-30 (both included). The following Models will be included SVM, Xgboost, Xgboost Cross-Validation, Earth Model, GBM and Neural Network.**
+
+## SVM Model
+
+*As a first model the Support Vector Machine (SVM) is calculated. It is a supervised machine learning model that uses classification algorithms for two-group classification problems. After giving feeding the SVM model sets of labeled training data for each category, they are able to categorize new datasets. Its calculations are evaluated based on the Mean Absolut Error (MAE).*
+
+```{r, echo=F, eval=F}
+set.seed(11)
+
+model_data <- cbind(Station = solar_farms[,2], add_var_scaled_nout[1:5113,colnames(add_var_scaled_nout) %in% z2$Variable])
+
+# row indices for validation data (70%)
+train_index <- sample(1:nrow(model_data),0.7*nrow(model_data))
+
+# row indices for validation data (15%)
+val_index <- sample(setdiff(1:nrow(model_data), train_index), 0.15*nrow(model_data));  
+
+# row indices for test data (15%)
+test_index <- setdiff(1:nrow(model_data), c(train_index, val_index));
+
+# split data
+train <- model_data[train_index,]
+val <- model_data[val_index,]
+test  <- model_data[test_index,]
+
+### Start cluster
+stopImplicitCluster();
+registerDoParallel(cores = detectCores()); 
+
+### Define grid
+c_values <- 10^seq(from = -2, to = 1, by = 0.5);
+eps_values <- 10^seq(from = -2, to = 0, by = 0.5);
+gamma_values <- 10^seq(from = -3, to = -1, by = 0.5);
+
+### Compute grid search
+
+grid_results <-  foreach (c = c_values, .combine = rbind)%:%
+  foreach (eps = eps_values, .combine = rbind)%:%
+  foreach (gamma = gamma_values, .combine = rbind)%dopar%{
+    
+    print(sprintf("Start of c = %s - eps = %s - gamma = %s", c, eps, gamma));
+    
+    # train SVM model with a particular set of hyperparamets
+    model <- svm(Station ~ ., data = train,kernel = 'radial',
+                 cost = c, epsilon = eps, gamma = gamma);
+    
+    # Get model predictions
+    predictions_train <- predict(model, newdata = train);
+    predictions_val <- predict(model, newdata = val);
+    
+    # Get errors
+    errors_train <- predictions_train - train$Station;
+    errors_val <- predictions_val - val$Station;
+    
+    # Compute Metrics
+    mse_train <- round(mean(errors_train^2), 2);
+    mae_train <- round(mean(abs(errors_train)), 2);
+    
+    mse_val <- round(mean(errors_val^2), 2);
+    mae_val <- round(mean(abs(errors_val)), 2);
+    
+    # Build comparison table
+    grid_results <- rbind(grid_results,
+                          data.table(c = c, eps = eps, gamma = gamma, 
+                                     mse_train = mse_train, mae_train = mae_train,
+                                     mse_val = mse_val, mae_val = mae_val));
+  }
+
+# Order results by increasing mse and mae
+grid_results <- grid_results[order(mae_val, mae_train)];
+
+# Check results
+best <- grid_results[1];
+
+### Train final model
+# train SVM model with best found set of hyperparamets
+model <- svm(Station ~ ., data = train, kernel="radial",
+             cost = best$c, epsilon = best$eps, gamma = best$gamma);
+
+# Get model predictions
+predictions_train <- predict(model, newdata = train);
+predictions_val <- predict(model, newdata = val);
+predictions_test <- predict(model, newdata = as.matrix(test));
+
+# Get errors
+errors_train <- predictions_train - train$Station;
+errors_val <- predictions_val - val$Station;
+errors_test <- predictions_test - test$Station;
+
+# Compute Metrics
+mae_train <- round(mean(abs(errors_train)), 2);
+mae_val <- round(mean(abs(errors_val)), 2);
+mae_test <- round(mean(abs(errors_test)), 2);
+
+## Summary
+sprintf("MAE_train = %s - MAE_val = %s - MAE_test = %s", mae_train, mae_val, mae_test);
+```
+
+
+## XGBOOST Model
+
+*'Extreme Gradient Boosting' (XGBoost) is used for supervised learning problems, where the training data (with multiple features) is used to predict a target variable, by drilling down into the data through decision-trees.*
+
+```{r, echo=F, eval=F}
+################################################### XGBOOST ###############################################################
+
+set.seed(11)
+
+#preparation of the data
+model_data <- cbind(Station = solar_farms[,2], add_var_scaled[1:5113,colnames(add_var_scaled) %in% z2$Variable],solar[1:5113,100:101])
+
+# row indices for validation data (70%)
+train_index <- sample(1:nrow(model_data),0.7*nrow(model_data))
+
+# row indices for validation data (15%)
+val_index <- sample(setdiff(1:nrow(model_data), train_index), 0.15*nrow(model_data)) 
+
+# row indices for test data (15%)
+test_index <- setdiff(1:nrow(model_data), c(train_index, val_index))
+
+
+# split data
+train <- model_data[train_index,]
+val <- model_data[val_index,]
+test  <- model_data[test_index,]
+
+### Start cluster
+stopImplicitCluster();
+registerDoParallel(cores = 9);
+
+
+### Define grid
+
+eta_values <- seq(from = 0.1, to = 0.5, by = 0.02)
+gamma_values <- seq(from = 0.1, to = 1, by = 0.1 )
+nrounds <- c(300,400,500,600)
+
+
+### Compute grid search
+grid_results_1 <- data.table()
+
+grid_results <-  for (eta in eta_values){
+  for (gamma in gamma_values){
+    for(nrounds in nrounds){
+    
+    #print(sprintf("Start of eta = %s - max_depth = %s - gamma = %s", eta, max_depth, gamma));
+    
+    # train xgboost model with a particular set of hyperparamets
+    model <- xgboost(as.matrix(train[,-1]), label = train$Station,
+                 eta = eta, max_depth = 1, nrounds = nrounds, 
+                 subsample = 1, verbose = 0,
+                 gamma = gamma);
+    
+    # Get model predictions
+    predictions_train <- predict(model, newdata = as.matrix(train[,-1]))
+    predictions_val <- predict(model, newdata = as.matrix(val[,-1]))
+    
+    # Get errors
+    errors_train <- predictions_train - train$Station;
+    errors_val <- predictions_val - val$Station;
+    
+    # Compute Metrics
+    rmse_train <- round(sqrt(mean(errors_train^2)), 2);
+    mae_train <- round(mean(abs(errors_train)), 2);
+    
+    rmse_val <- round(sqrt(mean(errors_val^2)), 2);
+    mae_val <- round(mean(abs(errors_val)), 2);
+    
+    # Build comparison table
+    grid_results_1 <<- rbind(grid_results_1,
+                          data.table(eta = eta, 
+                                     gamma = gamma, 
+                                     nrounds = nrounds,
+                                     mae_train = mae_train,
+                                     mae_val = mae_val,
+                                     diff = abs(mae_val-mae_train)));
+    print(grid_results_1)
+  }
+  }
+}
+
+# Order results by increasing mse and mae
+grid_results_1 <- mutate(grid_results_1,diff = abs(mae_train-mae_val))
+
+grid_results_1 <- grid_results_1[order(diff)];
+view(grid_results_1)
+
+# Check results
+best <- grid_results_1[2,1:2];
+```
+
+## XGBOOST Cross-Validation Model
+
+*'Extreme Gradient Boosting' (XGBoost) with Cross Validation. Through CV the performance of the ML algorithm is estimated with less variance than a single train-test set split. It works by splitting the dataset into k-parts (i.e. folds). It is trained on k-1 folds with one held back and tested on the held back fold. This is repeated so that each fold of the dataset is given a chance to be the held back test set.*
+
+```{r, echo=F, eval=F}
+### Compute grid search
+grid_results_1 <- data.table(eta = 0, 
+                             gamma = 0, 
+                             mae_train = 0,
+                             mae_val = 0,
+                             diff = 0)
+
+grid_results <-  for (eta in eta_values){
+  for (gamma in gamma_values){
+    
+    #print(sprintf("Start of eta = %s - max_depth = %s - gamma = %s", eta, max_depth, gamma));
+    
+    # train xgboost-CV model with a particular set of hyperparamets
+    model <<- xgb.cv(as.matrix(model_data[,-1]), label = model_data$Station, 
+                     params = list(eta = eta, max_depth = 1, subsample = 1, verbose = 0, gamma = gamma), 
+                     nfold=5, nrounds = 10, prediction = T, metrics=list("rmse"),cb.cv.predict(save_models = T))
+    print(model)
+  }
+}
+```
+
+## GBM Model
+
+*An implementation of extensions to Freund and Schapire's AdaBoost algorithm and Friedman's gradient boosting machine*
+
+```{r, echo=F, eval=F}
+#Predicting for the stations
+prediction_stations_gbm <- data.table(Date = solar[5114:nrow(solar),1])
+names_solarfarms <- colnames(solar_farms)
+
+#preparation of the data
+model_data <- cbind(Station = solar_farms[,2], add_var_scaled[1:5113,colnames(add_var_scaled) %in% z2$Variable])
+
+# split data
+test  <- add_var_scaled[5114:6909,colnames(add_var_scaled) %in% z2$Variable]
+
+
+
+trainctrl <- trainControl(method = "LGOCV", number = 3,savePredictions = T, allowParallel = TRUE)
+
+myGrid <- expand.grid(n.trees = c(150, 175, 200, 225),
+                      interaction.depth = c(5, 6, 7, 8, 9),
+                      shrinkage = c(0.075, 0.1, 0.125, 0.15, 0.2),
+                      n.minobsinnode = c(7, 10, 12, 15))
+
+gbm_tree_tune <- train(Station ~ ., data = model_data, method = "gbm", distribution = "gaussian",
+                       trControl = trainctrl, verbose = TRUE,
+                       tuneGrid = myGrid, metric = 'mae')
+
+for(i in 2:ncol(solar_farms)){
+  
+  #split data
+  train <- cbind(Station = solar_farms_nout[,i], add_var_scaled[1:5113,colnames(add_var_scaled) %in% z2$Variable])
+  
+  # train xgboost model with a particular set of hyperparamets
+  model <- train(Station ~ ., data = model_data, method = "gbm", distribution = "gaussian",
+                 trControl = trainctrl, verbose = TRUE,
+                 tuneGrid = myGrid)
+  
+  # Get model predictions
+  predictions <- as.data.table(predict(model, newdata = as.matrix(test)))
+  colnames(predictions) <-  names_solarfarms[i]
+  
+  # Build comparison table
+  prediction_stations_earth <<- cbind(prediction_stations_earth,
+                                      predictions);
+  
+  print(prediction_stations)
+}
+
+write.csv(prediction_stations_earth, '/Users/jvs22/Desktop/project/Rprediction_stations_earth.csv', row.names = F)
+
+prediction_stations_earth$Date <- solar[5114:nrow(solar),1]
+prediction_stations_earth$Date <- as.POSIXct(strptime(prediction_stations_earth$Date,format = '%Y%m%d', tz = 'us/central'))   #changing the date 
+
+all <- rbind(solar_farms,prediction_stations_earth)
+
+# ggplot(all,aes(Date,RETR)) + geom_line()
+```
+
+## Earth Model
+
+*The Earth Model builds a regression model using the techniques in Friedman’s papers "Multivariate Adaptive Regression Splines" and "Fast MARS".*
+
+```{r, echo=F, eval=F}
+# #Predicting for the stations
+# prediction_stations_earth <- data.table(Date = solar[5114:nrow(solar),1])
+# names_solarfarms <- colnames(solar_farms)
+# 
+# #preparation of the data
+# model_data <- cbind(Station = solar_farms_nout[,2], add_var_scaled[1:5113,colnames(add_var_scaled) %in% z2$Variable])
+# 
+# # split data
+# test  <- add_var_scaled[5114:6909,colnames(add_var_scaled) %in% z2$Variable]
+# 
+# 
+# for(i in 2:ncol(solar_farms)){
+#   
+#   #split data
+#   train <- cbind(Station = solar_farms_nout[,i], add_var_scaled[1:5113,colnames(add_var_scaled) %in% z2$Variable])
+#   
+#   # train xgboost model with a particular set of hyperparamets
+#   model <- earth(Station ~ ., data = train, pmethod = "cv", nfold = 5)
+#   
+#   # Get model predictions
+#   predictions <- as.data.table(predict(model, newdata = as.matrix(test)))
+#   colnames(predictions) <-  names_solarfarms[i]
+#   
+#   # Build comparison table
+#   prediction_stations_earth <<- cbind(prediction_stations_earth,
+#                                       predictions);
+#   
+#   print(prediction_stations)
+# }
+# 
+# write.csv(prediction_stations_earth, '/Users/jvs22/Desktop/project/Rprediction_stations_earth.csv', row.names = F)
+# 
+# prediction_stations_earth$Date <- solar[5114:nrow(solar),1]
+# prediction_stations_earth$Date <- as.POSIXct(strptime(prediction_stations_earth$Date,format = '%Y%m%d', tz = 'us/central'))   #changing the date 
+# 
+# all <- rbind(solar_farms,prediction_stations_earth)
+# 
+# ggplot(all,aes(Date,RETR)) + geom_line()
+```
+
+## Neural Network
+
+*A neural network is a model characterized by an activation function, which is used by interconnected information processing units to transform input into output. Information in passed through interconnected units analogous to information passage through neurons in humans. The first layer of the neural network receives the raw input, processes it and passes the processed information to the hidden layers. The hidden layer passes the information to the last layer, which produces the output. The advantage of neural network is that it is adaptive in nature. It learns from the information provided, i.e. trains itself from the data, which has a known outcome and optimizes its weights for a better prediction in situations with unknown outcome.*
+
+### Prediction Model
+
+*This section collects the computed data and compiles the final document that can be uploaded to Kaggle. In addition it shows the prediction result of one specific solar station (MIAM)*
+
+```{r, echo=F, eval=T}
+# library(xgboost)
+# library(ggplot2)
+# #Predicting for the stations
+# prediction_stations_xgboost <- data.table(Date = solar[5114:nrow(solar),1])
+# names_solarfarms <- colnames(solar_farms)
+# 
+# #preparation of the data
+# model_data <- cbind(Station = solar_farms[,2], add_var_scaled[1:5113,colnames(add_var_scaled) %in% z2$Variable])
+# 
+# # split data
+# test  <- add_var_scaled[5114:6909,colnames(add_var_scaled) %in% z2$Variable]
+# 
+# 
+# for(i in 2:ncol(solar_farms)){
+#   
+#   #split data
+#   train <- cbind(Station = solar_farms[,i], add_var_scaled[1:5113,colnames(add_var_scaled) %in% z2$Variable])
+#   
+#   # train xgboost model with a particular set of hyperparamets
+#   model <- xgboost(as.matrix(train[,-1]), label = train$Station,
+#                    eta = best$eta, max_depth = 1, nrounds = 1000, 
+#                    subsample = 1, verbose = 0, gamma = best$gamma);
+#   
+#   # Get model predictions
+#   predictions <- as.data.table(predict(model, newdata = as.matrix(test)))
+#   colnames(predictions) <-  names_solarfarms[i]
+#   
+#   # Build comparison table
+#   prediction_stations_xgboost <<- cbind(prediction_stations_xgboost,
+#                                         predictions);
+#   print(prediction_stations_xgboost)
+# }
+# 
+# # write.csv(prediction_stations_xgboost, '/Users/jvs22/Desktop/project/Prediction_stations_xgboost.csv', row.names = F)
+# 
+# prediction_stations_xgboost$Date <- as.POSIXct(strptime(prediction_stations_xgboost$Date,format = '%Y%m%d', tz = 'us/central'))   #changing the date 
+# 
+# all <- rbind(solar_farms,prediction_stations_xgboost)
+# all$Values <- ifelse(all$Date < '2008-01-01', 'Given', 'Predicted')
+# 
+# ggplot(data=all,aes(Date,MIAM, group = Values, colour = Values)) + geom_line() + 
+#   scale_color_manual(values=c("#dfae00", "#aa151b")) + xlab('Years') + ylab('Daily incoming solar energy') + 
+#   ggtitle('Prediction of daily incoming solar energy of solar station MIAM') + theme_light()
+```
+
+# **Conclusion**
+
+Team C has tested all of the following Machine Learning Models, in order to identify the most suitable one for this Analysis. Multiple different variations were tested in SVM, Xgboost, Xgboost Cross-Validation, Earth Model, GBM and Neural Networks. After a thorough investigation of the obtained results, Team C came to the conclusion, that the Xgboost Model scores the best prediction values for the solar production of each of the 98 Mesonet farms.
+
+As it can be seen in the following graph, the yellow lines portray the real solar production data, whereas the red lines show the predicted ones. 
+
+![Prediction of daily incoming solar energy of solar station MIAM](/Users/jvs22/Desktop/project/Prediction.png)
+
+*Xgboost Kaggle Scores:* 6124085.75747, 3564215.80930, 3326697.10040, 3328738.04402, 3427184.33400
+*The best Xgboost Kaggle Score is:* 3326697.10040
+
+
